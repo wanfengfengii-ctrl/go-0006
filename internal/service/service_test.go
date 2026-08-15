@@ -43,8 +43,8 @@ func mustCreateCyclePolicy(t *testing.T, svc *Service, tenant, resource string, 
 	t.Helper()
 	mustCreateTenant(t, svc, tenant)
 	_, err := svc.CreatePolicy(context.Background(), tenant, resource, PolicySpec{
-		Type:         string(domain.PolicyCycle),
-		CycleLimit:   limit,
+		Type:          string(domain.PolicyCycle),
+		CycleLimit:    limit,
 		CycleLengthMS: 60_000, // 1 minute
 	})
 	if err != nil {
@@ -209,10 +209,10 @@ func TestAcceptance3_CommitIdempotencyAndConflict(t *testing.T) {
 
 	// Commit with usage 25: 15 returned.
 	commit1, err := svc.Commit(context.Background(), CommitRequest{
-		ReservationID: res.ReservationID,
-		TenantID:      "tnt",
+		ReservationID:  res.ReservationID,
+		TenantID:       "tnt",
 		IdempotencyKey: "k1",
-		Usage:         map[string]int64{"r": 25},
+		Usage:          map[string]int64{"r": 25},
 	})
 	if err != nil {
 		t.Fatalf("commit: %v", err)
@@ -231,10 +231,10 @@ func TestAcceptance3_CommitIdempotencyAndConflict(t *testing.T) {
 
 	// Repeat with same key + same usage: returns first response, idempotent.
 	commit2, err := svc.Commit(context.Background(), CommitRequest{
-		ReservationID: res.ReservationID,
-		TenantID:      "tnt",
+		ReservationID:  res.ReservationID,
+		TenantID:       "tnt",
 		IdempotencyKey: "k1",
-		Usage:         map[string]int64{"r": 25},
+		Usage:          map[string]int64{"r": 25},
 	})
 	if err != nil {
 		t.Fatalf("repeat commit: %v", err)
@@ -250,10 +250,10 @@ func TestAcceptance3_CommitIdempotencyAndConflict(t *testing.T) {
 
 	// Same key but different usage: conflict, nothing changes.
 	_, err = svc.Commit(context.Background(), CommitRequest{
-		ReservationID: res.ReservationID,
-		TenantID:      "tnt",
+		ReservationID:  res.ReservationID,
+		TenantID:       "tnt",
 		IdempotencyKey: "k1",
-		Usage:         map[string]int64{"r": 30},
+		Usage:          map[string]int64{"r": 30},
 	})
 	if AsCode(err) != CodeIdempotencyConflict {
 		t.Fatalf("expected conflict, got %v", err)
@@ -444,6 +444,52 @@ func TestAcceptance5_TokenBucketBoundariesAndRestart(t *testing.T) {
 		if entriesBefore[i].Amount != entriesAfter[i].Amount {
 			t.Fatalf("amount mismatch at %d: %d vs %d", i, entriesBefore[i].Amount, entriesAfter[i].Amount)
 		}
+	}
+}
+
+func TestReservationTriggeredRefillLedgerConsistency(t *testing.T) {
+	svc, clk, _ := newTestService(t)
+	mustCreateTokenBucket(t, svc, "tnt", "tb", 10, 0, 5, 1000)
+
+	clk.AdvanceDuration(1_000_000_000)
+	resp := mustReserve(t, svc, ReserveRequest{
+		TenantID: "tnt",
+		Items:    []Item{{Resource: "tb", Amount: 1}},
+	})
+	if len(resp.Balances) != 1 {
+		t.Fatalf("balances = %d, want 1", len(resp.Balances))
+	}
+	bal := resp.Balances[0]
+	if bal.Balance != 5 || bal.Frozen != 1 || bal.Available != 4 {
+		t.Fatalf("balance/frozen/available = %d/%d/%d, want 5/1/4", bal.Balance, bal.Frozen, bal.Available)
+	}
+
+	entries, err := svc.ListLedger(context.Background(), "tnt", 0, 1000)
+	if err != nil {
+		t.Fatalf("list ledger: %v", err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("ledger entries = %d, want 3", len(entries))
+	}
+	if entries[1].Type != string(domain.EntryRefill) || entries[1].Amount != 5 {
+		t.Fatalf("reservation-triggered entry = %+v, want refill amount 5", entries[1])
+	}
+	if entries[2].Type != string(domain.EntryReserve) || entries[2].Amount != 1 {
+		t.Fatalf("entry after refill = %+v, want reserve amount 1", entries[2])
+	}
+
+	rec, err := svc.Reconcile(context.Background())
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if !rec.OK {
+		t.Fatalf("reconcile not OK: %+v", rec.Mismatches)
+	}
+	if err := svc.Recover(context.Background()); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if svc.Faulted() {
+		t.Fatalf("service faulted after recovery: %s", svc.FaultReason())
 	}
 }
 

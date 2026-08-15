@@ -29,7 +29,7 @@ type Service struct {
 	// faulted is set when a projection invariant check fails. While true the
 	// service is read-only: queries and diagnostics still work, but mutations
 	// are rejected with CodeReadonly.
-	faulted         bool
+	faulted          bool
 	faultReasonCache string
 }
 
@@ -176,13 +176,13 @@ func (s *Service) CreatePolicy(ctx context.Context, tenantID, resource string, s
 			et = domain.EntryCycleReset
 		}
 		_, err := tx.InsertLedgerEntry(ctx, domain.LedgerEntry{
-			TenantID:       tenantID,
-			Type:           et,
-			Resource:       resource,
-			Amount:         p.InitialBalance(),
-			PolicyVersion:  p.Version,
-			CycleNumber:    bal.CurrentCycle,
-			Ts:             p.CreatedAt,
+			TenantID:      tenantID,
+			Type:          et,
+			Resource:      resource,
+			Amount:        p.InitialBalance(),
+			PolicyVersion: p.Version,
+			CycleNumber:   bal.CurrentCycle,
+			Ts:            p.CreatedAt,
 		})
 		return err
 	})
@@ -365,17 +365,17 @@ func balanceToSnapshot(bal domain.Balance, p domain.Policy) BalanceSnapshot {
 
 func specToPolicy(tenantID, resource string, version int64, now clock.Time, spec PolicySpec) (domain.Policy, error) {
 	p := domain.Policy{
-		TenantID:        tenantID,
-		Resource:        resource,
-		Version:         version,
-		CreatedAt:       now,
-		RefillInterval:  clock.Duration(specMillisToNanos(spec.RefillIntervalMS)),
-		CycleLength:     clock.Duration(specMillisToNanos(spec.CycleLengthMS)),
-		CycleAnchor:     clock.Time(spec.CycleAnchorNS),
-		Capacity:        spec.Capacity,
-		InitialTokens:   spec.InitialTokens,
-		RefillAmount:    spec.RefillAmount,
-		CycleLimit:      spec.CycleLimit,
+		TenantID:       tenantID,
+		Resource:       resource,
+		Version:        version,
+		CreatedAt:      now,
+		RefillInterval: clock.Duration(specMillisToNanos(spec.RefillIntervalMS)),
+		CycleLength:    clock.Duration(specMillisToNanos(spec.CycleLengthMS)),
+		CycleAnchor:    clock.Time(spec.CycleAnchorNS),
+		Capacity:       spec.Capacity,
+		InitialTokens:  spec.InitialTokens,
+		RefillAmount:   spec.RefillAmount,
+		CycleLimit:     spec.CycleLimit,
 	}
 	switch domain.PolicyType(spec.Type) {
 	case "", domain.PolicyTokenBucket:
@@ -673,8 +673,9 @@ type reserveIdempotencyRequest struct {
 func (s *Service) reserveTx(ctx context.Context, tx store.Tx, tenantID, reservationID string, items []domain.ReservationItem, expiresAt clock.Time) (*ReserveResponse, error) {
 	now := s.clock.Now()
 	type staged struct {
-		p   domain.Policy
-		bal domain.Balance
+		p     domain.Policy
+		bal   domain.Balance
+		extra []domain.LedgerEntry
 	}
 	stagedMap := make(map[string]staged, len(items))
 	var sortedResources []string
@@ -696,11 +697,11 @@ func (s *Service) reserveTx(ctx context.Context, tx store.Tx, tenantID, reservat
 			}
 			return nil, err
 		}
-		bal, _, err = settleTokenBucket(ctx, tx, p, bal, now)
+		bal, extra, err := settleTokenBucket(ctx, tx, p, bal, now)
 		if err != nil {
 			return nil, err
 		}
-		stagedMap[it.Resource] = staged{p: p, bal: bal}
+		stagedMap[it.Resource] = staged{p: p, bal: bal, extra: extra}
 		sortedResources = append(sortedResources, it.Resource)
 	}
 	sort.Strings(sortedResources)
@@ -713,26 +714,15 @@ func (s *Service) reserveTx(ctx context.Context, tx store.Tx, tenantID, reservat
 		}
 	}
 
-	// Persist refills (settle may have advanced balances without entries; if
-	// no refill entry, the balance itself is unchanged so nothing to write
-	// yet). We re-settle to capture any refill entry. Since settle is
-	// idempotent, this is safe; but to avoid a second settle we capture the
-	// extra entries in the first pass instead.
-	// (The first pass discarded the extra entries; recompute deterministically.)
+	// Persist refills before reservation entries so the ledger explains the
+	// settled balances used by the availability check.
 	var allEntries []LedgerEntryView
 	for _, r := range sortedResources {
 		st := stagedMap[r]
-		// Re-run settle to obtain the refill entry deterministically.
-		bal2, extra, err := settleTokenBucket(ctx, tx, st.p, st.bal, now)
-		if err != nil {
-			return nil, err
-		}
-		st.bal = bal2
-		stagedMap[r] = st
 		if err := tx.UpsertBalance(ctx, st.bal); err != nil {
 			return nil, err
 		}
-		for _, e := range extra {
+		for _, e := range st.extra {
 			e.PolicyVersion = st.p.Version
 			seq, err := tx.InsertLedgerEntry(ctx, e)
 			if err != nil {
@@ -749,14 +739,14 @@ func (s *Service) reserveTx(ctx context.Context, tx store.Tx, tenantID, reservat
 		st := stagedMap[it.Resource]
 		st.bal.Frozen += it.Amount
 		entry := domain.LedgerEntry{
-			TenantID:       tenantID,
-			Type:           domain.EntryReserve,
-			Resource:       it.Resource,
-			Amount:         it.Amount,
-			PolicyVersion:  st.p.Version,
-			CycleNumber:    st.bal.CurrentCycle,
-			ReservationID:  reservationID,
-			Ts:             now,
+			TenantID:      tenantID,
+			Type:          domain.EntryReserve,
+			Resource:      it.Resource,
+			Amount:        it.Amount,
+			PolicyVersion: st.p.Version,
+			CycleNumber:   st.bal.CurrentCycle,
+			ReservationID: reservationID,
+			Ts:            now,
 		}
 		seq, err := tx.InsertLedgerEntry(ctx, entry)
 		if err != nil {
@@ -868,14 +858,14 @@ func (s *Service) commitTx(ctx context.Context, tx store.Tx, req CommitRequest) 
 		if used > 0 {
 			bal.Balance -= used
 			charge := domain.LedgerEntry{
-				TenantID:       req.TenantID,
-				Type:           domain.EntryCommitCharge,
-				Resource:       it.Resource,
-				Amount:         used,
-				PolicyVersion:  p.Version,
-				CycleNumber:    bal.CurrentCycle,
-				ReservationID:  req.ReservationID,
-				Ts:             now,
+				TenantID:      req.TenantID,
+				Type:          domain.EntryCommitCharge,
+				Resource:      it.Resource,
+				Amount:        used,
+				PolicyVersion: p.Version,
+				CycleNumber:   bal.CurrentCycle,
+				ReservationID: req.ReservationID,
+				Ts:            now,
 			}
 			seq, err := tx.InsertLedgerEntry(ctx, charge)
 			if err != nil {
@@ -889,14 +879,14 @@ func (s *Service) commitTx(ctx context.Context, tx store.Tx, req CommitRequest) 
 		bal.Frozen -= it.Amount
 		if release > 0 {
 			rel := domain.LedgerEntry{
-				TenantID:       req.TenantID,
-				Type:           domain.EntryReleaseUnused,
-				Resource:       it.Resource,
-				Amount:         release,
-				PolicyVersion:  p.Version,
-				CycleNumber:    bal.CurrentCycle,
-				ReservationID:  req.ReservationID,
-				Ts:             now,
+				TenantID:      req.TenantID,
+				Type:          domain.EntryReleaseUnused,
+				Resource:      it.Resource,
+				Amount:        release,
+				PolicyVersion: p.Version,
+				CycleNumber:   bal.CurrentCycle,
+				ReservationID: req.ReservationID,
+				Ts:            now,
 			}
 			seq, err := tx.InsertLedgerEntry(ctx, rel)
 			if err != nil {
@@ -970,14 +960,14 @@ func (s *Service) rollbackTx(ctx context.Context, tx store.Tx, req RollbackReque
 		}
 		bal.Frozen -= it.Amount
 		entry := domain.LedgerEntry{
-			TenantID:       req.TenantID,
-			Type:           domain.EntryRollbackRelease,
-			Resource:       it.Resource,
-			Amount:         it.Amount,
-			PolicyVersion:  p.Version,
-			CycleNumber:    bal.CurrentCycle,
-			ReservationID:  req.ReservationID,
-			Ts:             now,
+			TenantID:      req.TenantID,
+			Type:          domain.EntryRollbackRelease,
+			Resource:      it.Resource,
+			Amount:        it.Amount,
+			PolicyVersion: p.Version,
+			CycleNumber:   bal.CurrentCycle,
+			ReservationID: req.ReservationID,
+			Ts:            now,
 		}
 		seq, err := tx.InsertLedgerEntry(ctx, entry)
 		if err != nil {
