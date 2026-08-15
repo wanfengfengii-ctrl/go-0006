@@ -673,8 +673,9 @@ type reserveIdempotencyRequest struct {
 func (s *Service) reserveTx(ctx context.Context, tx store.Tx, tenantID, reservationID string, items []domain.ReservationItem, expiresAt clock.Time) (*ReserveResponse, error) {
 	now := s.clock.Now()
 	type staged struct {
-		p   domain.Policy
-		bal domain.Balance
+		p     domain.Policy
+		bal   domain.Balance
+		extra []domain.LedgerEntry
 	}
 	stagedMap := make(map[string]staged, len(items))
 	var sortedResources []string
@@ -696,11 +697,11 @@ func (s *Service) reserveTx(ctx context.Context, tx store.Tx, tenantID, reservat
 			}
 			return nil, err
 		}
-		bal, _, err = settleTokenBucket(ctx, tx, p, bal, now)
+		bal, extra, err := settleTokenBucket(ctx, tx, p, bal, now)
 		if err != nil {
 			return nil, err
 		}
-		stagedMap[it.Resource] = staged{p: p, bal: bal}
+		stagedMap[it.Resource] = staged{p: p, bal: bal, extra: extra}
 		sortedResources = append(sortedResources, it.Resource)
 	}
 	sort.Strings(sortedResources)
@@ -713,26 +714,19 @@ func (s *Service) reserveTx(ctx context.Context, tx store.Tx, tenantID, reservat
 		}
 	}
 
-	// Persist refills (settle may have advanced balances without entries; if
-	// no refill entry, the balance itself is unchanged so nothing to write
-	// yet). We re-settle to capture any refill entry. Since settle is
-	// idempotent, this is safe; but to avoid a second settle we capture the
-	// extra entries in the first pass instead.
-	// (The first pass discarded the extra entries; recompute deterministically.)
+	// Persist the lazy refill captured in the first pass. The balance was
+	// already advanced by settleTokenBucket; here we write both the updated
+	// projection and its matching refill ledger entry so the projection stays
+	// equal to a fresh replay of the ledger. Re-settling would be a no-op
+	// (settle is idempotent once last_refill_time has advanced) and would drop
+	// the entry, so the entry must come from the first pass.
 	var allEntries []LedgerEntryView
 	for _, r := range sortedResources {
 		st := stagedMap[r]
-		// Re-run settle to obtain the refill entry deterministically.
-		bal2, extra, err := settleTokenBucket(ctx, tx, st.p, st.bal, now)
-		if err != nil {
-			return nil, err
-		}
-		st.bal = bal2
-		stagedMap[r] = st
 		if err := tx.UpsertBalance(ctx, st.bal); err != nil {
 			return nil, err
 		}
-		for _, e := range extra {
+		for _, e := range st.extra {
 			e.PolicyVersion = st.p.Version
 			seq, err := tx.InsertLedgerEntry(ctx, e)
 			if err != nil {
